@@ -1,0 +1,218 @@
+package com.your.package; // <- change to match your project
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+import java.lang.reflect.Method;
+import java.time.Instant;
+import java.util.*;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.http.HttpStatus;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.util.UriTemplate;
+
+@ExtendWith(MockitoExtension.class)
+class PalAbstractRestClientTest {
+
+    // We'll create a small concrete subclass to test protected/private methods
+    private PalAbstractRestClient<Object, Object> client;
+
+    private MockedStatic<PalJsonUtils> palJsonUtilsStatic;
+
+    @BeforeEach
+    void setup() {
+        // anonymous concrete subclass satisfying abstract methods
+        client = new PalAbstractRestClient<>() {
+            @Override
+            protected HttpMethod httpMethod(final PalRestClientRequest<Object, Object> webRequest) {
+                // simple default for tests
+                return HttpMethod.GET;
+            }
+
+            @Override
+            protected List<PalGenericCodeModel> handleClientErrorResponse(final PalRestClientRequest<Object, Object> serviceRequest, final byte[] rawBytes, final HttpStatus httpStatus) {
+                return Collections.emptyList();
+            }
+        };
+
+        // mock static PalJsonUtils used in JSON transform paths
+        palJsonUtilsStatic = Mockito.mockStatic(PalJsonUtils.class);
+    }
+
+    @AfterEach
+    void tearDown() {
+        palJsonUtilsStatic.close();
+    }
+
+    @Test
+    void evaluateMappedHeader_specialValuesAndEnv() throws Exception {
+        // call private method evaluateMappedHeader via reflection
+        Method m = PalAbstractRestClient.class.getDeclaredMethod("evaluateMappedHeader", String.class);
+        m.setAccessible(true);
+
+        // transactionId -> should produce a UUID string
+        String tId = (String) m.invoke(client, "transactionId");
+        assertNotNull(tId);
+        assertDoesNotThrow(() -> UUID.fromString(tId)); // valid UUID
+
+        // currentTimestamp -> parseable Instant
+        String ts = (String) m.invoke(client, "currentTimestamp");
+        Instant.parse(ts); // will throw if invalid
+
+        // epochTime -> numeric string
+        String epoch = (String) m.invoke(client, "epochTime");
+        assertTrue(epoch.matches("\\d+"));
+
+        // fallback to System property
+        System.setProperty("SOME_TEST_PROP", "propValue");
+        String val = (String) m.invoke(client, "SOME_TEST_PROP");
+        assertEquals("propValue", val);
+
+        // fallback to env var (simulate by setting a property if env is not available)
+        // if environment variable is present in CI, assert non-null, otherwise at least invocation succeeds
+        String maybeEnv = (String) m.invoke(client, "PATH"); // PATH likely exists
+        assertNotNull(maybeEnv);
+    }
+
+    @Test
+    void createUriParams_usesTransactionalObjectsAndJsonPath() {
+        // mock request and nested definitions
+        PalRestClientRequest<Object, Object> request = mock(PalRestClientRequest.class);
+        PalRestClientServiceDefinition serviceDef = mock(PalRestClientServiceDefinition.class);
+
+        // URI template with variables
+        when(serviceDef.getUri()).thenReturn("/users/{userId}/orders/{orderId}");
+        when(request.getServiceDefinition()).thenReturn(serviceDef);
+
+        // transactionalObjects map containing userId only
+        Map<String, Object> transactionalObjects = new HashMap<>();
+        transactionalObjects.put("userId", "u-123");
+        when(request.getTransactionalObjects()).thenReturn(transactionalObjects);
+
+        // no uriParameters - return null / empty
+        when(request.getUriParameters()).thenReturn(null);
+
+        // request body JSON contains orderId at deep path
+        String requestJson = "{\"some\": {\"orderId\":\"o-999\"}}";
+        when(request.getRequest()).thenReturn(requestJson);
+
+        // JsonPath.read will be invoked by createUriParams when searching request for variable.
+        // PalAbstractRestClient uses JsonPath.read(webRequest.getRequest(), "$.." + vName)
+        // We cannot mock JsonPath static easily; but because it is called only inside createUriParams when transactionalObjects lacks the value,
+        // we can instead ensure transactionalObjects contains both values OR mock JsonPath via static. We'll mock JsonPath.read using a small shim.
+
+        // Mock JsonPath static method (from com.jayway.jsonpath.JsonPath)
+        MockedStatic<com.jayway.jsonpath.JsonPath> jsonPathStatic = Mockito.mockStatic(com.jayway.jsonpath.JsonPath.class);
+        jsonPathStatic.when(() -> com.jayway.jsonpath.JsonPath.read(requestJson, "$..orderId"))
+                .thenReturn(Collections.singletonList("o-999"));
+
+        // call method
+        Map<String, Object> params = client.createUriParams(request);
+
+        assertThat(params).containsEntry("userId", "u-123");
+        assertThat(params).containsEntry("orderId", "o-999");
+
+        jsonPathStatic.close();
+    }
+
+    @Test
+    void buildHttpHeaders_setsAcceptAndContentAndMappedHeaders() {
+        // create request and service/host defs
+        PalRestClientRequest<Object, Object> request = mock(PalRestClientRequest.class);
+        PalRestClientServiceDefinition serviceDef = mock(PalRestClientServiceDefinition.class);
+        PalRestClientHostDefinition hostDef = mock(PalRestClientHostDefinition.class);
+
+        when(request.getServiceDefinition()).thenReturn(serviceDef);
+        when(request.getHostDefinition()).thenReturn(hostDef);
+
+        when(serviceDef.getProduces()).thenReturn(MediaType.APPLICATION_JSON_VALUE);
+        when(serviceDef.getConsumes()).thenReturn(MediaType.APPLICATION_JSON_VALUE);
+
+        // prepare header mapping that createHeaderParameter would provide
+        Map<String, String> hdrs = new HashMap<>();
+        hdrs.put("apikey", "{{transactionId}}");
+        hdrs.put("x-client-id", "client-42");
+
+        // We'll spy the client and stub createHeaderParameter to return our map
+        PalAbstractRestClient<Object, Object> spyClient = spy(client);
+        doReturn(hdrs).when(spyClient).createHeaderParameter(any());
+
+        // Now call buildHttpHeaders
+        HttpHeaders headers = spyClient.buildHttpHeaders(request);
+
+        // Accept header set to application/json
+        assertTrue(headers.getAccept().contains(MediaType.APPLICATION_JSON));
+        assertEquals(MediaType.APPLICATION_JSON, headers.getContentType());
+
+        // Check that 'apikey' masked or present as generated value; evaluateMappedHeader will produce a UUID for transactionId
+        String apiKey = headers.getFirst("apikey");
+        assertNotNull(apiKey);
+        // Should be non-empty string (transactionId -> uuid)
+        assertFalse(apiKey.isBlank());
+
+        // custom header unchanged
+        assertEquals("client-42", headers.getFirst("x-client-id"));
+    }
+
+    @Test
+    void buildHttpEntity_withBodyAndHeaders_returnsEntity() {
+        PalRestClientRequest<Object, Object> request = mock(PalRestClientRequest.class);
+        PalAbstractRestClient<Object, Object> spyClient = spy(client);
+
+        // stub createHttpBody to return a simple map body
+        Map<String, String> body = Map.of("a", "b");
+        doReturn(body).when(spyClient).createHttpBody(any());
+
+        // stub buildHttpHeaders to return headers
+        HttpHeaders hdrs = new HttpHeaders();
+        hdrs.set("h1", "v1");
+        doReturn(hdrs).when(spyClient).buildHttpHeaders(any());
+
+        HttpEntity<?> entity = spyClient.buildHttpEntity(request);
+
+        assertNotNull(entity);
+        assertEquals(body, entity.getBody());
+        assertEquals("v1", entity.getHeaders().getFirst("h1"));
+    }
+
+    @Test
+    void transformClientResponse_handlesJsonResponseAndSetsResult() throws Exception {
+        PalRestClientRequest<Object, Object> request = mock(PalRestClientRequest.class);
+        PalRestClientResponseModel<Object> responseModel = mock(PalRestClientResponseModel.class);
+
+        when(request.getResponse()).thenReturn(responseModel);
+        when(request.responseType()).thenReturn((Class<Object>) (Class) String.class);
+        when(request.getMediaType()).thenReturn(MediaType.APPLICATION_JSON);
+
+        // sample JSON bytes
+        String json = "{\"data\":{\"name\":\"john\"},\"totalCount\":5}";
+        byte[] rawBytes = json.getBytes();
+
+        // configure PalJsonUtils mocks used by transformJsonResponse
+        palJsonUtilsStatic.when(PalJsonUtils::withObjectMapper).thenReturn(new com.fasterxml.jackson.databind.ObjectMapper());
+        palJsonUtilsStatic.when(() -> PalJsonUtils.pathReadFromJsonString(json, request.getResultKeys()))
+                .thenReturn(null); // simulate no path read
+        palJsonUtilsStatic.when(() -> PalJsonUtils.readValue(eq(json), any(com.fasterxml.jackson.databind.JavaType.class)))
+                .thenReturn("PARSED_STRING");
+
+        // call transformClientResponse
+        client.transformClientResponse(request, HttpStatus.OK, rawBytes);
+
+        // verify that setter on responseModel setResult called with parsed value and http status set to OK
+        verify(responseModel).setResult("PARSED_STRING");
+        verify(responseModel).setHttpStatus(HttpStatus.OK);
+    }
+}
