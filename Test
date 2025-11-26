@@ -1,0 +1,135 @@
+package your.package.here; // <- change to your package
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+import java.util.HashMap;
+import java.util.Map;
+
+import jakarta.servlet.http.HttpServletRequest; // or javax.servlet if your project uses that
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.ResponseEntity;
+
+@ExtendWith(MockitoExtension.class)
+class PalCmiProxyRestControllerTest {
+
+    @Mock
+    private PalProxyService proxyService; // mocked dependency
+
+    // Use a spy on the controller so we can stub the forwardRequest(...) method
+    private PalCmiProxyRestController controllerSpy;
+
+    @Captor
+    private ArgumentCaptor<PalForwardHttpRequest> forwardRequestCaptor;
+
+    @BeforeEach
+    void setUp() {
+        // create real controller instance and then spy it
+        PalCmiProxyRestController controller = new PalCmiProxyRestController(proxyService);
+        controllerSpy = spy(controller);
+    }
+
+    @Test
+    void handleAllRequests_withBody_callsForwardRequest_andReturnsResponse() {
+        // Arrange
+        Map<String, String> pathVariables = new HashMap<>();
+        pathVariables.put("appCode", "TEST_APP");
+
+        PalMapModel body = mock(PalMapModel.class);
+
+        Map<String, Object> requestParams = new HashMap<>();
+        requestParams.put("q", "value");
+
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        when(request.getMethod()).thenReturn("POST");
+        when(request.getRequestURI()).thenReturn("/proxy/v1/app/TEST_APP/some/path");
+
+        ResponseEntity<Object> fakeResponse = ResponseEntity.ok("OK-FORWARDED");
+        // stub controller's forwardRequest(...) so we don't need its real implementation
+        doReturn(fakeResponse).when(controllerSpy).forwardRequest(any(PalForwardHttpRequest.class));
+
+        // Act
+        ResponseEntity<Object> actual = controllerSpy.handleAllRequests(pathVariables, body, requestParams, request);
+
+        // Assert: response is forwarded response
+        assertNotNull(actual);
+        assertEquals(fakeResponse, actual);
+
+        // Verify forwardRequest was called once and capture the argument
+        verify(controllerSpy, times(1)).forwardRequest(forwardRequestCaptor.capture());
+        PalForwardHttpRequest captured = forwardRequestCaptor.getValue();
+        assertNotNull(captured);
+
+        // Validate that controller set appCode and uri correctly
+        // These assertions assume PalForwardHttpRequest has the shown getters
+        assertEquals("TEST_APP", captured.getAppCode(), "appCode should be set on the forward request");
+        assertNotNull(captured.getUri(), "uri should not be null");
+        // If the request body is exposed as getBody()
+        assertSame(body, captured.getBody(), "body should be forwarded unchanged");
+    }
+
+    @Test
+    void handleAllRequests_withoutBody_callsForwardRequest_andReturnsResponse() {
+        // Arrange (body is null)
+        Map<String, String> pathVariables = new HashMap<>();
+        pathVariables.put("appCode", "NO_BODY_APP");
+
+        PalMapModel body = null;
+
+        Map<String, Object> requestParams = new HashMap<>();
+
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        when(request.getMethod()).thenReturn("PUT");
+        when(request.getRequestURI()).thenReturn("/proxy/v1/app/NO_BODY_APP/");
+
+        ResponseEntity<Object> fakeResponse = ResponseEntity.ok("OK-NOBODY");
+        doReturn(fakeResponse).when(controllerSpy).forwardRequest(any(PalForwardHttpRequest.class));
+
+        // Act
+        ResponseEntity<Object> actual = controllerSpy.handleAllRequests(pathVariables, body, requestParams, request);
+
+        // Assert
+        assertNotNull(actual);
+        assertEquals(fakeResponse, actual);
+
+        // Verify forwarding happened and captured object reflects null body
+        verify(controllerSpy).forwardRequest(forwardRequestCaptor.capture());
+        PalForwardHttpRequest captured = forwardRequestCaptor.getValue();
+        assertEquals("NO_BODY_APP", captured.getAppCode());
+        // If getBody() exists, it should be null
+        assertNull(captured.getBody(), "when no request body provided, forward request body should be null");
+    }
+
+    @Test
+    void handleAllRequests_whenForwardRequestThrows_propagatesException() {
+        // Arrange
+        Map<String, String> pathVariables = new HashMap<>();
+        pathVariables.put("appCode", "ERR_APP");
+
+        PalMapModel body = mock(PalMapModel.class);
+
+        Map<String, Object> requestParams = new HashMap<>();
+
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        when(request.getMethod()).thenReturn("PATCH");
+        when(request.getRequestURI()).thenReturn("/proxy/v1/app/ERR_APP/err");
+
+        // make forwardRequest throw to exercise exception path
+        RuntimeException ex = new RuntimeException("forward failed");
+        doThrow(ex).when(controllerSpy).forwardRequest(any(PalForwardHttpRequest.class));
+
+        // Act & Assert: exception propagated
+        RuntimeException thrown = assertThrows(RuntimeException.class,
+                () -> controllerSpy.handleAllRequests(pathVariables, body, requestParams, request));
+        assertSame(ex, thrown);
+        verify(controllerSpy).forwardRequest(any(PalForwardHttpRequest.class));
+    }
+}
