@@ -1,0 +1,147 @@
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.Mockito;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.mail.javamail.JavaMailSender;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class PalEmailAppInternalServiceTest {
+
+    // ==== mocks used in ALL tests ====
+
+    @Mock
+    private JavaMailSender emailSender;
+
+    @Mock
+    private PalEmailAutoConfigProperties emailConfig;
+
+    @Mock
+    private PalServiceInRequest<PalEmailAppInternalRequest, PalEmailResonse> serviceRequest;
+
+    @Mock
+    private PalEmailAppInternalRequest request;
+
+    @Mock
+    private PalEmailResonse response;
+
+    @Mock
+    private PalEmailPropertyModel propertyModel;
+
+    // the service under test (spied so we can stub send(..))
+    private PalEmailAppInternalService service;
+
+    @BeforeEach
+    void setup() {
+        // use real constructor, but spy so we can stub send(...)
+        service = Mockito.spy(new PalEmailAppInternalService(emailSender, emailConfig));
+
+        // common stubbing for all tests
+        when(serviceRequest.getRequest()).thenReturn(request);
+        when(serviceRequest.getResponse()).thenReturn(response);
+    }
+
+    // =====================================================================
+    //  TEST 1 – this corresponds to your "test send email" scenario
+    // =====================================================================
+    @Test
+    @DisplayName("test send email - should send mail and set result when context found")
+    void shouldSendMailAndSetResult_whenContextFound() {
+        // ---------- arrange ----------
+        String context = "myContext";
+        List<String> attachments = List.of("attachment1", "attachment2");
+        String content = "content";
+
+        when(request.getContext()).thenReturn(context);
+        when(request.getAttachments()).thenReturn(attachments);
+        when(request.getContent()).thenReturn(content);
+
+        // context map from config contains our context key
+        when(emailConfig.getContextMap()).thenReturn(Map.of(context, propertyModel));
+
+        // email properties for that context
+        when(propertyModel.getEmailFrom()).thenReturn("from@test.com");
+        when(propertyModel.getEmailTo()).thenReturn("to@test.com");
+        when(propertyModel.getEmailcc()).thenReturn("cc@test.com");
+        when(propertyModel.getSubject()).thenReturn("Test Subject");
+
+        // stub send(..) on the spy
+        PalEmailResonse sendResult = mock(PalEmailResonse.class);
+        doReturn(sendResult).when(service).send(any(PalEmailRequestModel.class));
+
+        // ---------- act ----------
+        service.businessLogic(serviceRequest);
+
+        // ---------- assert ----------
+        // capture the PalEmailRequestModel that was built
+        ArgumentCaptor<PalEmailRequestModel> emailReqCaptor =
+                ArgumentCaptor.forClass(PalEmailRequestModel.class);
+        verify(service).send(emailReqCaptor.capture());
+
+        PalEmailRequestModel builtRequest = emailReqCaptor.getValue();
+        assertEquals(attachments, builtRequest.getAttachments());
+        assertEquals(content, builtRequest.getContent());
+        assertEquals("from@test.com", builtRequest.getEmailFrom());
+        assertEquals("to@test.com", builtRequest.getEmailTo());
+        assertEquals("cc@test.com", builtRequest.getEmailcc());
+        assertEquals("Test Subject", builtRequest.getSubject());
+
+        // response should be set with the send result
+        verify(response).setResult(sendResult);
+        verify(response, never()).buildInternalError(any());
+    }
+
+    // =====================================================================
+    //  TEST 2 – no matching context in config
+    // =====================================================================
+    @Test
+    @DisplayName("businessLogic should do nothing when context is not found")
+    void shouldDoNothing_whenContextNotFound() {
+        String context = "missingContext";
+        when(request.getContext()).thenReturn(context);
+
+        // context map has different key -> optGroup.isPresent() == false
+        when(emailConfig.getContextMap()).thenReturn(Map.of("otherContext", propertyModel));
+
+        service.businessLogic(serviceRequest);
+
+        verify(service, never()).send(any(PalEmailRequestModel.class));
+        verify(response, never()).setResult(any());
+        verify(response, never()).buildInternalError(any());
+    }
+
+    // =====================================================================
+    //  TEST 3 – send(..) throws, should buildInternalError
+    // =====================================================================
+    @Test
+    @DisplayName("businessLogic should build internal error when send throws")
+    void shouldBuildInternalError_whenSendThrows() {
+        String context = "myContext";
+        when(request.getContext()).thenReturn(context);
+        when(emailConfig.getContextMap()).thenReturn(Map.of(context, propertyModel));
+
+        when(request.getAttachments()).thenReturn(List.of());
+        when(request.getContent()).thenReturn("content");
+        when(propertyModel.getEmailFrom()).thenReturn("from@test.com");
+        when(propertyModel.getEmailTo()).thenReturn("to@test.com");
+        when(propertyModel.getEmailcc()).thenReturn("cc@test.com");
+        when(propertyModel.getSubject()).thenReturn("Subject");
+
+        RuntimeException ex = new RuntimeException("mail failure");
+        doThrow(ex).when(service).send(any(PalEmailRequestModel.class));
+
+        service.businessLogic(serviceRequest);
+
+        verify(response).buildInternalError(ex);
+        verify(response, never()).setResult(any());
+    }
+}
